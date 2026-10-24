@@ -1,6 +1,8 @@
 
 import os
-from flask import Flask, jsonify
+from functools import wraps
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from supabase import create_client
 
@@ -10,42 +12,34 @@ CORS(
     app,
     resources={
         r"/*": {
-            "origins": [
-                "https://7mr-sam7.github.io"
-            ]
+            "origins": ["https://7mr-sam7.github.io"]
         }
     }
 )
 
-supabase = None
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
 
-try:
-    url = os.environ["SUPABASE_URL"]
-    key = os.environ["SUPABASE_SECRET_KEY"]
-    supabase = create_client(url, key)
-except Exception as error:
-    print("Erro ao configurar Supabase:", error)
+if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+    raise RuntimeError("Configure as variáveis do Supabase no Render.")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
-@app.route("/")
+@app.get("/")
 def home():
     return jsonify({
-        "status": "online",
-        "projeto": "Special Core Backend"
+        "service": "Special Core Backend",
+        "status": "online"
     })
 
 
-@app.route("/health")
+@app.get("/health")
 def health():
-    if supabase is None:
-        return jsonify({
-            "status": "error",
-            "mensagem": "Supabase nao configurado"
-        }), 500
-
     try:
         supabase.table("site_settings").select(
-            "id"
+            "setting_key"
         ).limit(1).execute()
 
         return jsonify({
@@ -54,13 +48,87 @@ def health():
         })
 
     except Exception:
-        app.logger.exception("Falha ao consultar Supabase")
+        app.logger.exception("Erro ao testar o Supabase")
         return jsonify({
             "status": "error",
-            "mensagem": "Falha ao acessar o banco"
+            "message": "Falha ao acessar o banco"
+        }), 500
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_TOKEN:
+            return jsonify({
+                "error": "ADMIN_TOKEN não configurado no servidor"
+            }), 503
+
+        token = request.headers.get("X-Admin-Token", "")
+
+        if token != ADMIN_TOKEN:
+            return jsonify({
+                "error": "Não autorizado"
+            }), 401
+
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+@app.get("/api/settings")
+def get_settings():
+    try:
+        result = supabase.table("site_settings").select(
+            "setting_key,setting_value,updated_at"
+        ).execute()
+
+        settings = {
+            row["setting_key"]: row["setting_value"]
+            for row in result.data
+        }
+
+        return jsonify({"settings": settings})
+
+    except Exception:
+        app.logger.exception("Erro ao ler configurações")
+        return jsonify({
+            "error": "Não foi possível ler as configurações"
+        }), 500
+
+
+@app.put("/api/settings/<setting_key>")
+@admin_required
+def update_setting(setting_key):
+    if not setting_key or len(setting_key) > 100:
+        return jsonify({"error": "Chave inválida"}), 400
+
+    body = request.get_json(silent=True)
+
+    if not isinstance(body, dict) or "value" not in body:
+        return jsonify({
+            "error": "Envie um JSON com o campo value"
+        }), 400
+
+    try:
+        result = supabase.table("site_settings").upsert(
+            {
+                "setting_key": setting_key,
+                "setting_value": body["value"]
+            },
+            on_conflict="setting_key"
+        ).execute()
+
+        return jsonify({
+            "status": "ok",
+            "saved": result.data
+        })
+
+    except Exception:
+        app.logger.exception("Erro ao salvar configuração")
+        return jsonify({
+            "error": "Não foi possível salvar a configuração"
         }), 500
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
